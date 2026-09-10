@@ -1,0 +1,84 @@
+diff --git a/packages/artinchip/lvgl-ui/aic_widgets/aic_player/lv_aic_player.c b/packages/artinchip/lvgl-ui/aic_widgets/aic_player/lv_aic_player.c
+index 3eb35d7e2..9c1371596 100644
+--- a/packages/artinchip/lvgl-ui/aic_widgets/aic_player/lv_aic_player.c
++++ b/packages/artinchip/lvgl-ui/aic_widgets/aic_player/lv_aic_player.c
+@@ -131,6 +131,8 @@ src_failed:
+ 
+ void lv_aic_player_set_cmd(lv_obj_t * obj, lv_aic_player_cmd_t cmd, void *data)
+ {
++    uint8_t area_reset = true;
++
+     lv_aic_player_t * player = (lv_aic_player_t *)obj;
+ 
+     if (!obj || !player->ctx || !player->timer || lv_player_is_slave(obj))
+@@ -140,6 +142,8 @@ void lv_aic_player_set_cmd(lv_obj_t * obj, lv_aic_player_cmd_t cmd, void *data)
+     case LV_AIC_PLAYER_CMD_START:
+         player_backend_control(player->ctx, PLAYER_CMD_START, data);
+         player_backend_control(player->ctx, PLAYER_CMD_GET_FRAME, NULL);
++        //lv_obj_update_layout(obj);
++        player_backend_control(player->ctx, PLAYER_CMD_UPDATE_DISPLAY_AREA, &area_reset);
+         lv_timer_resume(player->timer);
+         break;
+     case LV_AIC_PLAYER_CMD_STOP:
+diff --git a/packages/artinchip/lvgl-ui/aic_widgets/aic_player/player_backend/aic_backend_ops.c b/packages/artinchip/lvgl-ui/aic_widgets/aic_player/player_backend/aic_backend_ops.c
+index 724ba4066..fa6127b18 100644
+--- a/packages/artinchip/lvgl-ui/aic_widgets/aic_player/player_backend/aic_backend_ops.c
++++ b/packages/artinchip/lvgl-ui/aic_widgets/aic_player/player_backend/aic_backend_ops.c
+@@ -106,7 +106,7 @@ static int aic_player_event_callback(void *ctx, int event_type, int param1, int
+ static void *player_decode_entry(void *ptr);
+ 
+ /* Player command handlers */
+-static lv_res_t player_handle_update_display_area(void *ctx);
++static lv_res_t player_handle_update_display_area(void *ctx,void* data);
+ static lv_res_t player_handle_get_frame(void *ctx);
+ 
+ const player_backend_ops_t aic_backend_ops_template  = {
+@@ -282,7 +282,7 @@ static lv_res_t aic_player_backend_set_src(void *ctx, const char *src)
+ 
+     /* here are the video related settings */
+     if (aic_ctx->draw_layer == LV_AIC_PLAYER_LAYER_VIDEO) {
+-        player_handle_update_display_area(ctx);
++        player_handle_update_display_area(ctx, NULL);
+         if (!aic_ctx->keep_last_frame) {
+             int enable = 1;
+             aic_player_control(aic_ctx->player, AIC_PLAYER_CMD_SET_VIDEO_RENDER_KEEP_LAST_FRAME, &enable);
+@@ -368,7 +368,7 @@ static lv_res_t aic_player_backend_control(void *ctx, player_cmd_t cmd, void *da
+         case PLAYER_CMD_GET_FRAME:
+             return player_handle_get_frame(ctx);
+         case PLAYER_CMD_UPDATE_DISPLAY_AREA:
+-            return player_handle_update_display_area(ctx);
++            return player_handle_update_display_area(ctx,data);
+         case PLAYER_CMD_GET_IMAGE_SRC:
+             if (!aic_ctx->image_src || !data) {
+                 return LV_RES_INV;
+@@ -1029,7 +1029,7 @@ static int calc_video_physical_display_rect(struct mpp_rect *disp_rect, lv_area_
+     return 0;
+ }
+ 
+-static lv_res_t player_handle_update_display_area(void *ctx)
++static lv_res_t player_handle_update_display_area(void *ctx,void* data)
+ {
+     player_backend_ops_t *player_ctx = (player_backend_ops_t *)ctx;
+     lv_obj_t *obj = (lv_obj_t *)player_ctx->obj;
+@@ -1068,6 +1068,12 @@ static lv_res_t player_handle_update_display_area(void *ctx)
+                                        image->rotation, image->scale_x,
+                                        image->scale_y, &pivot_px);
+ #endif
++
++    if (data){
++        aic_ctx->area.x1=-1;
++        aic_ctx->area.x2=-1;
++    }
++
+     lv_area_move(&real_area, area.x1, area.y1);
+     if (aic_ctx->image_rotation == lv_image_get_rotation(obj) &&
+         aic_ctx->disp_rotation == lv_disp_get_rotation(lv_disp_get_default()) &&
+@@ -1097,7 +1103,7 @@ static lv_res_t player_handle_update_display_area(void *ctx)
+         LV_LOG_ERROR("aic_player_set_disp_rect failed");
+         return LV_RES_INV;
+     }
+-
++    
+     if (calc_video_mpp_rotation_with_check(obj, &video_rotate) < 0)
+         return LV_RES_INV;
+ 

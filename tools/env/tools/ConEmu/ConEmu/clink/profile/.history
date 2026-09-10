@@ -1,0 +1,6 @@
+list
+scons --list-def
+pwd
+ps
+ls
+cat AGENTS.md 

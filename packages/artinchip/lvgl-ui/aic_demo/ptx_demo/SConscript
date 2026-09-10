@@ -1,0 +1,50 @@
+from building import *
+import os
+
+# check if .h or .hpp files exist in a directory
+def check_h_hpp_exist(path):
+    file_dirs = os.listdir(path)
+    for file_dir in file_dirs:
+        if os.path.splitext(file_dir)[1] in ['.h', '.hpp']:
+            return True
+    return False
+
+cwd = GetCurrentDir()
+group = []
+src = Glob('*.c')
+inc = [cwd]
+
+# Recursively walk all subdirectories for .c files and include paths
+lvgl_cwd = cwd + '/'
+for root, dirs, files in os.walk(cwd):
+    for d in dirs:
+        current_path = os.path.join(root, d)
+        rela_path = current_path.replace(lvgl_cwd, '')
+        src = src + Glob(rela_path + '/*.c')
+        if check_h_hpp_exist(current_path):
+            inc = inc + [current_path]
+
+# Add LVGL include path based on version (at end — ptx_demo paths take priority)
+lvgl_ui_dir = os.path.dirname(os.path.dirname(cwd))
+# print('lvgl_ui_dir:', lvgl_ui_dir)
+if GetDepend(['LVGL_V_8']):
+    inc = inc + [os.path.join(lvgl_ui_dir, 'lvgl_v8', 'lvgl')]
+elif GetDepend(['LVGL_V_9']):
+    inc = inc + [os.path.join(lvgl_ui_dir, 'lvgl_v9', 'lvgl')]
+# print('inc:', inc)
+
+# Install assets to LVGL storage path
+if GetDepend(['LVGL_STORAGE_PATH']):
+    ins_dst = GetDepend('LVGL_STORAGE_PATH').strip('"/')
+else:
+    ins_dst = 'rodata/lvgl_data'
+
+ins_src = 'assets/'
+install = [(ins_src, ins_dst)]
+
+LOCAL_CCFLAGS = ' -DSW_MAX_NUM=3'
+
+group = group + DefineGroup('LVGL-port', src, depend = ['AIC_LVGL_PTX_DEMO'],
+        CPPPATH = inc, INSTALL = install, LOCAL_CCFLAGS = LOCAL_CCFLAGS)
+
+Return('group')
