@@ -365,6 +365,9 @@ static int aic_de_timing_enable(void)
 #endif
 #endif
 
+    comp->bg_blend_ui_en = 1;
+    de_ui_bg_blending_enable(comp->regs,comp->bg_blend_ui_en);
+    
     aic_de_set_gamma_config(&comp->gamma);
     aic_de_set_ccm_config(&comp->ccm);
 

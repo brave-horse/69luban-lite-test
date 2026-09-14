@@ -11,202 +11,42 @@
 #include "lv_aic_player.h"
 #include "lvgl.h"
 
-#define VIDEO_PATH_PREFIX       "L:/rodata/lvgl_data/video/"
-#define VIDEO_TEXT_FONT_PATH    "/rodata/lvgl_data/font/MiSans-Medium.ttf"
-#define VIDEO_TEXT_COUNT        5
-#define VIDEO_TEXT_SIZE         48
-#define VIDEO_TEXT_ROW_GAP      70
-#define VIDEO_SMALL_WIDTH       200
-#define VIDEO_SMALL_HEIGHT      200
+    static void btn_cb(lv_event_t *e){
+    lv_obj_t *cont1 = lv_event_get_user_data(e);
 
-/* 视频资源列表。 */
-static const char *const m_video_paths[] = {
-    VIDEO_PATH_PREFIX "1.mp4",
-    VIDEO_PATH_PREFIX "11.mp4",
-};
-
-static lv_obj_t *m_video_screen;
-static lv_obj_t *m_video_player;
-static lv_font_t *m_video_text_font;
-static unsigned int m_video_index;
-
-static void video_switch_cb(lv_event_t *event);
-static void video_swipe_cb(lv_event_t *event);
-
-/* 根据当前视频设置播放器的位置和尺寸。 */
-static void video_layout_set(unsigned int index)
-{
-    if (!m_video_player)
-    {
-        return;
+    static bool  opaa= false;
+    lv_obj_set_style_bg_opa(cont1, opaa?LV_OPA_100:LV_OPA_80, LV_PART_MAIN);
+    opaa = !opaa;
     }
-
-    /* 1.mp4 使用原始尺寸并显示在左上角。 */
-    if (index == 0U)
-    {
-        lv_obj_set_pos(m_video_player, 0, 0);
-        lv_aic_player_set_width(m_video_player, VIDEO_SMALL_WIDTH);
-        lv_aic_player_set_height(m_video_player, VIDEO_SMALL_HEIGHT);
-        return;
-    }
-
-    /* 其他视频铺满整个屏幕。 */
-    lv_obj_set_pos(m_video_player, 0, 0);
-    lv_aic_player_set_width(m_video_player, LV_HOR_RES);
-    lv_aic_player_set_height(m_video_player, LV_VER_RES);
-}
-
-/* 播放指定视频。 */
-static bool video_play_set(const char *path)
-{
-    if (!m_video_player || !path)
-    {
-        return false;
-    }
-
-    if (lv_aic_player_set_src(m_video_player, path) != LV_RES_OK)
-    {
-        return false;
-    }
-
-    video_layout_set(m_video_index);
-    lv_aic_player_set_cmd(m_video_player, LV_AIC_PLAYER_CMD_START, NULL);
-    return true;
-}
-
-/* 创建视频页面。 */
-static lv_obj_t *video_screen_create(void)
-{
-    lv_obj_t *screen = lv_obj_create(NULL);
-
-    if (!screen)
-    {
-        return NULL;
-    }
-
-    lv_obj_set_size(screen, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(screen, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(screen, 0, LV_PART_MAIN);
-    return screen;
-}
-
-/* 配置播放器图层和输入事件。 */
-static void video_player_setup(void)
-{
-    if (!m_video_player)
-    {
-        return;
-    }
-
-    lv_obj_add_flag(m_video_player, LV_OBJ_FLAG_CLICKABLE);
-    lv_aic_player_set_draw_layer(m_video_player, LV_AIC_PLAYER_LAYER_VIDEO);
-    lv_obj_add_event_cb(m_video_player, video_switch_cb,
-                        LV_EVENT_SHORT_CLICKED, NULL);
-    lv_obj_add_event_cb(m_video_player, video_swipe_cb,
-                        LV_EVENT_GESTURE, NULL);
-}
-
-/* 创建页面上的测试文字。 */
-static void video_text_create(void)
-{
-    if (!m_video_screen)
-    {
-        return;
-    }
-
-#if LVGL_VERSION_MAJOR == 9 && LV_USE_FREETYPE
-    m_video_text_font = lv_freetype_font_create(
-        VIDEO_TEXT_FONT_PATH,
-        LV_FREETYPE_FONT_RENDER_MODE_BITMAP,
-        VIDEO_TEXT_SIZE,
-        LV_FREETYPE_FONT_STYLE_NORMAL);
-#endif
-
-    for (unsigned int row = 0; row < VIDEO_TEXT_COUNT; row++)
-    {
-        lv_obj_t *label = lv_label_create(m_video_screen);
-
-        if (!label)
-        {
-            continue;
-        }
-
-        lv_label_set_text(label, "aaaaa");
-        if (m_video_text_font)
-        {
-            lv_obj_set_style_text_font(label, m_video_text_font,
-                                       LV_PART_MAIN);
-        }
-        lv_obj_set_style_bg_color(label, lv_color_hex(0x002341),
-                                  LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(label, 10, LV_PART_MAIN);
-        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF),
-                                    LV_PART_MAIN);
-        lv_obj_align(label, LV_ALIGN_CENTER, 0,
-                     ((int)row - VIDEO_TEXT_COUNT / 2) * VIDEO_TEXT_ROW_GAP);
-        lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
-    }
-}
-
-/* 切换到下一个视频。 */
-static void video_switch_cb(lv_event_t *event)
-{
-    (void)event;
-
-    m_video_index = (m_video_index + 1U) %
-                    (sizeof(m_video_paths) / sizeof(m_video_paths[0]));
-    (void)video_play_set(m_video_paths[m_video_index]);
-}
-
-/* 处理播放器上的左右滑动。 */
-static void video_swipe_cb(lv_event_t *event)
-{
-    lv_indev_t *indev;
-    lv_dir_t direction;
-
-    if (!event)
-    {
-        return;
-    }
-
-    indev = lv_indev_get_act();
-    if (!indev || lv_event_get_target(event) != m_video_player)
-    {
-        return;
-    }
-
-    direction = lv_indev_get_gesture_dir(indev);
-    if (direction == LV_DIR_LEFT || direction == LV_DIR_RIGHT)
-    {
-        video_switch_cb(event);
-    }
-}
 
 /* 初始化视频播放器页面。 */
 void ui_init(void)
 {
-    /* 创建承载播放器和文字的 LVGL 页面。 */
-    m_video_screen = video_screen_create();
-    if (!m_video_screen)
-    {
-        return;
-    }
+    
 
-    /* 创建视频播放器，并挂载到视频页面。 */
-    m_video_player = lv_aic_player_create(m_video_screen);
-    if (!m_video_player)
-    {
-        return;
-    }
+    lv_obj_t *cont = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(cont, 600, 200);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_radius(cont, 20, 0);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 0, 0);
+    lv_obj_align(cont, LV_ALIGN_CENTER, 0, -100);
+    lv_obj_set_style_clip_corner(cont, true, 0);
 
-    /* 配置播放器事件，并创建页面上的文字。 */
-    video_player_setup();
-    video_text_create();
+    lv_obj_t *cont1 = lv_obj_create(cont);
+    lv_obj_set_size(cont1, 300, 175);
+    lv_obj_set_style_bg_color(cont1, lv_color_white(), 0);
+    lv_obj_set_style_radius(cont1, 0, 0);
+    lv_obj_set_style_border_width(cont1, 0, 0);
+    lv_obj_set_style_pad_all(cont1, 0, 0);
+    lv_obj_align(cont1, LV_ALIGN_LEFT_MID, 80, 0);
 
-    /* 显示页面后播放第一个视频。 */
-    m_video_index = 0U;
-    lv_scr_load(m_video_screen);
-    (void)video_play_set(m_video_paths[m_video_index]);
+    lv_obj_set_style_bg_opa(cont1, LV_OPA_80, LV_PART_MAIN);
+
+    lv_obj_t *btn = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(btn, 300, 100);
+    lv_obj_align(btn, LV_ALIGN_CENTER, 0, 100);
+    
+    lv_obj_add_event_cb(btn, btn_cb, LV_EVENT_SHORT_CLICKED, cont1);
+
 }
