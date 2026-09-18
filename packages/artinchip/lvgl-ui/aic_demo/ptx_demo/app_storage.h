@@ -36,6 +36,10 @@ void storage_skip_setup_set(bool skip);
 bool storage_wifi_enable_get(void);
 void storage_wifi_enable_set(bool enable);
 
+/* WiFi manager compatibility: report initialization and persistence failures. */
+bool app_storage_wifi_enabled_load(bool *enabled);
+bool app_storage_wifi_enabled_save(bool enabled);
+
 bool storage_screen_rot_get(void);
 void storage_screen_rot_set(bool rot);
 
@@ -50,6 +54,8 @@ void storage_screen_rot_set(bool rot);
 
 #define storage_wifi_enable_get()        true
 #define storage_wifi_enable_set(skip)
+#define app_storage_wifi_enabled_load(enabled) ((enabled) ? (*(enabled) = true, true) : false)
+#define app_storage_wifi_enabled_save(enabled) true
 
 #define storage_screen_rot_get()        true
 #define storage_screen_rot_set(skip)

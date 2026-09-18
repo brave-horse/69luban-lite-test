@@ -205,6 +205,40 @@ bool storage_wifi_enable_get(void)
     return s_flags.wifi_enabled > 0;
 }
 
+bool app_storage_wifi_enabled_load(bool *enabled)
+{
+    if (!enabled || !s_initialized || !storage_cache_lock())
+    {
+        return false;
+    }
+    *enabled = s_flags.wifi_enabled > 0;
+    storage_cache_unlock();
+    return true;
+}
+
+bool app_storage_wifi_enabled_save(bool enabled)
+{
+    if (!s_initialized || !storage_cache_lock())
+    {
+        return false;
+    }
+    uint8_t previous = s_flags.wifi_enabled;
+    uint8_t requested = enabled ? 1U : 0U;
+    if (previous == requested)
+    {
+        storage_cache_unlock();
+        return true;
+    }
+    s_flags.wifi_enabled = requested;
+    bool saved = storage_save_impl(STORAGE_FLAGS_KEY, &s_flags, sizeof(s_flags));
+    if (!saved)
+    {
+        s_flags.wifi_enabled = previous;
+    }
+    storage_cache_unlock();
+    return saved;
+}
+
 void storage_wifi_enable_set(bool enable)
 {
     storage_cache_lock();

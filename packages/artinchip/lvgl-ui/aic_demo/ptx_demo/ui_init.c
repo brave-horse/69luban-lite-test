@@ -5,6 +5,7 @@
 #include "lv_aic_player.h"
 #include "lvgl.h"
 #include "wifi_utils.h"
+#include "app_storage.h"
 #include "drv_fb.h"
 
 #include <aic_osal.h>
@@ -14,7 +15,11 @@
 #define PTX_WIFI_NETWORK_COUNT      4U
 #define PTX_WIFI_POLL_MS            200U
 #define PTX_WIFI_RETRY_DELAY_MS     1000U
-#define PTX_WIFI_THREAD_STACK_SIZE (8U * 1024U)
+/* Requests may wait behind a scan; empty results also trigger a delayed rescan. */
+#define PTX_WIFI_CONNECT_WAIT_MS   (WIFI_JOIN_TIMEOUT_MS + WIFI_SCAN_TIMEOUT_MS + WIFI_RETRY_MS)
+#define PTX_WIFI_SCAN_WAIT_MS      (2U * WIFI_SCAN_TIMEOUT_MS + WIFI_RETRY_MS)
+/* Storage initialization enters the filesystem and NAND driver call chain. */
+#define PTX_WIFI_THREAD_STACK_SIZE WIFI_THREAD_STACK_SIZE
 #define PTX_WIFI_THREAD_PRIORITY    25U
 
 typedef struct {
@@ -77,7 +82,7 @@ static bool ptx_wifi_connect_one(const ptx_wifi_network_t *network)
 
     /* The WiFi API is asynchronous. Retry while its request queue is busy. */
     while (elapsed < WIFI_JOIN_TIMEOUT_MS) {
-        ret = wifi_request_connect(network->ssid, network->password, true);
+        ret = wifi_request_connect(network->ssid, network->password);
         if (ret == 0) {
             break;
         }
@@ -95,7 +100,7 @@ static bool ptx_wifi_connect_one(const ptx_wifi_network_t *network)
     }
 
     elapsed = 0;
-    while (elapsed < WIFI_JOIN_TIMEOUT_MS) {
+    while (elapsed < PTX_WIFI_CONNECT_WAIT_MS) {
         wifi_state_t state = wifi_get_current_state();
 
         if (state == WIFI_STATE_CONNECTED) {
@@ -154,7 +159,7 @@ static bool ptx_wifi_scan_once(void)
     printf("[ptx_wifi] scan requested\n");
     elapsed = 0;
 
-    while (elapsed < WIFI_SCAN_TIMEOUT_MS) {
+    while (elapsed < PTX_WIFI_SCAN_WAIT_MS) {
         ret = wifi_get_scan_result(&result);
         if (ret == 0 && !result.scanning && !result.scan_pending &&
             result.scan_sequence != old_sequence) {
@@ -187,15 +192,31 @@ static void ptx_wifi_thread_entry(void *parameter)
 
     (void)parameter;
 
+    if (!app_storage_init()) {
+        printf("[ptx_wifi] app_storage_init failed\n");
+        return;
+    }
+
     if (wifi_init() != 0) {
         printf("[ptx_wifi] wifi_init failed\n");
         return;
     }
 
     if (!wifi_is_enabled()) {
-        int ret = wifi_request_set_enabled(true);
+        uint32_t elapsed = 0;
+        int ret;
 
-        if (ret != 0 && !wifi_is_enabled()) {
+        /* The new API can fail transiently while its snapshot lock is busy. */
+        do {
+            ret = wifi_request_set_enabled(true);
+            if (ret == 0 || wifi_is_enabled()) {
+                break;
+            }
+            aicos_msleep(PTX_WIFI_POLL_MS);
+            elapsed += PTX_WIFI_POLL_MS;
+        } while (elapsed < WIFI_JOIN_TIMEOUT_MS);
+
+        if (!wifi_is_enabled()) {
             printf("[ptx_wifi] enable WiFi failed: ret=%d\n", ret);
             return;
         }

@@ -15,12 +15,10 @@
 #include <netdev.h>
 #endif
 
-/* 启用后的首次扫描稍后启动；不为扫描空结果安排额外重试。 */
-#define WIFI_SCAN_START_DELAY_MS 2000U
+/* 针对 AIC 全信道扫描的快速空返回进行保守复查，耗时不是成功判据。 */
+#define WIFI_EMPTY_SCAN_MIN_MS 100U
+#define WIFI_SCAN_RETRY_DELAY_MS 2000U
 #define WIFI_MANUAL_FALLBACK_DELAY_MS 700U
-
-#define WIFI_SCAN_PENDING 1U
-#define WIFI_SCAN_RUNNING 2U
 
 /* 锁内只复制内存，驱动和文件操作放在锁外。UI 取锁超时为 0。 */
 static aicos_mutex_t m_lock;               // 快照和请求锁
@@ -33,7 +31,8 @@ static wifi_request_t m_request;           // 待处理的 WiFi 请求
 static char m_station_mac[32];             // 本机 WiFi MAC 地址
 static atomic_uint m_enabled;              // 对外要求的 WiFi 开关状态
 static atomic_uint m_state;                // 对外发布的 WiFi 状态
-static atomic_uint m_scan_flags;           // 原子维护排队/执行状态，UI 提交不取快照锁
+static atomic_uint m_scan_requested;       // 是否请求开始扫描
+static atomic_uint m_scan_done;             // 扫描是否完成
 static atomic_uint m_join_failed;          // 连接是否失败
 static atomic_uint m_generation;            // 请求代次，用于取消旧请求
 static atomic_uint m_enable_changed;        // 开关变化，包含工作线程未及时看到的快速关开
@@ -52,28 +51,20 @@ static struct {
 static bool m_actual_enabled;              // 驱动当前实际开关状态
 static bool m_auto_connect;                // 是否允许自动连接
 static bool m_joining;                     // 是否正在连接
+static bool m_empty_scan_retry;            // 是否正在确认首次空扫描结果
 static bool m_auto_scan_ready;             // 是否有尚未用于自动连接的新扫描结果
 static bool m_join_automatic;              // 当前连接是否为后台自动重连
 static bool m_scan_invalidated;            // 扫描期间发生断线，由 m_lock 保护
 static uint32_t m_scan_tick;               // 本次扫描开始时间
 static uint32_t m_scan_call_ms;            // 扫描接口耗时，不包含工作线程收尾等待
-static uint32_t m_scan_enable_tick;        // WiFi 启用后的延迟起点
-static bool m_scan_start_delayed;          // 仅延迟启用后的首次扫描
+static uint32_t m_scan_retry_tick;         // 扫描延迟等待起点
+static bool m_scan_delayed;                // 开启或空扫描后等待再扫描
 static uint32_t m_join_tick;               // 本次连接开始时间
 static uint32_t m_retry_tick;              // 上次自动重试时间
 static wifi_request_t m_join;              // 当前正在执行的连接请求
 static unsigned m_join_generation;          // 当前连接请求代次
 static char m_auto_last_attempt[33];        // 自动失败后从该热点的下一个候选继续
 static struct rt_wlan_device *m_event_device;
-
-/* 内部请求可在扫描期间排队；清除请求时保留仍在执行的扫描状态。 */
-static void wifi_scan_queue_set(bool pending)
-{
-    if (pending)
-        atomic_fetch_or(&m_scan_flags, WIFI_SCAN_PENDING);
-    else
-        atomic_fetch_and(&m_scan_flags, ~WIFI_SCAN_PENDING);
-}
 
 /* 获取 WiFi 数据锁。 */
 static void wifi_lock(void)
@@ -170,7 +161,7 @@ static void wifi_link_lost_publish(void)
         m_snapshot.publish_sequence++;
         m_scan_invalidated = true;
         atomic_store(&m_link_lost, true);
-        wifi_scan_queue_set(true);
+        atomic_store(&m_scan_requested, true);
     }
     wifi_unlock();
     if (lost) {
@@ -183,6 +174,13 @@ static void wifi_event(struct rt_wlan_device *device, rt_wlan_dev_event_t event,
 {
     (void)device;
     (void)parameter;
+    /* 扫描完成时唤醒工作线程收尾。 */
+    if (event == RT_WLAN_DEV_EVT_SCAN_DONE)
+    {
+        atomic_store(&m_scan_done, true);
+        aicos_sem_give(m_wakeup);
+        return;
+    }
     /* 连接失败时记录失败标志并唤醒工作线程。 */
     if (event == RT_WLAN_DEV_EVT_CONNECT_FAIL)
     {
@@ -267,7 +265,7 @@ static void wifi_event(struct rt_wlan_device *device, rt_wlan_dev_event_t event,
 static int wifi_events_bind(void)
 {
     static const rt_wlan_dev_event_t events[] = {
-        RT_WLAN_DEV_EVT_SCAN_REPORT,
+        RT_WLAN_DEV_EVT_SCAN_REPORT, RT_WLAN_DEV_EVT_SCAN_DONE,
         RT_WLAN_DEV_EVT_CONNECT_FAIL, RT_WLAN_DEV_EVT_DISCONNECT
     };
     struct rt_wlan_device *device = (struct rt_wlan_device *)rt_device_find(WIFI_DEVICE);
@@ -404,86 +402,88 @@ static bool wifi_info_read(wifi_info_t *info)
     return info->ip[0] != 0;
 }
 
-static void wifi_scan_finish(int error);
-
-/* 仅由 WiFi 工作线程同步扫描，LVGL 只提交请求和读取快照。 */
+/* 保留已发布列表并启动新的 WiFi 扫描。 */
 static void wifi_scan_start(void)
 {
-    /* 只在 WiFi 工作线程等待管理锁，与串口扫描串行，避免混入其结果。 */
+    /* AIC 扫描同步回传结果，持管理锁划定本轮扫描的接收范围。 */
     rt_wlan_mgnt_lock();
     int error = wifi_events_bind();
+    atomic_store(&m_scan_done, false);
     m_auto_scan_ready = false;
     wifi_lock();
-    if (!atomic_load(&m_enabled) || atomic_load(&m_enable_changed))
-    {
-        wifi_unlock();
-        rt_wlan_mgnt_unlock();
-        return;
-    }
     m_snapshot.scanning = true;
     m_scan_invalidated = false;
     /* 在同一把锁内从排队切换到扫描，避免页面看到中间的空闲状态。 */
-    atomic_exchange(&m_scan_flags, WIFI_SCAN_RUNNING);
+    atomic_store(&m_scan_requested, false);
     m_scan_ap_num = 0;
     m_snapshot.error = 0;
     m_snapshot.scan_error = 0;
     m_snapshot.publish_sequence++;
     wifi_unlock();
     m_scan_tick = wifi_now();
-    m_scan_start_delayed = false;
-    /* 与 wifi scan 相同：调用一次，由管理层等待完成；UI 不执行此调用。
-     * 不持 m_lock 等待驱动，也不在此执行 LVGL、文件写入或逐热点打印。 */
+    m_scan_delayed = false;
+    /* 调用驱动开始扫描，错误结果交给工作线程处理。 */
+    rt_kprintf("[wifi] scan start\n");
     if (!error)
     {
-        error = rt_wlan_scan_with_info(NULL);
+        error = rt_wlan_scan();
     }
     m_scan_call_ms = wifi_now() - m_scan_tick;
-    wifi_scan_finish(error);
     rt_wlan_mgnt_unlock();
+    if (!error)
+    {
+        return;
+    }
+    rt_kprintf("[wifi] scan start failed: %d\n", error);
+    wifi_lock();
+    m_snapshot.error = error;
+    m_snapshot.scan_error = error;
+    wifi_unlock();
+    atomic_store(&m_scan_done, true);
 }
 
 /* 结束扫描、排序结果并刷新已保存标志。 */
-static void wifi_scan_finish(int error)
+static void wifi_scan_finish(bool timeout)
 {
-    int sync_ret = error;
     /* 失败或超时时保留上一份列表，避免临时错误清空已显示的网络。 */
     wifi_lock();
-    bool cancelled = !atomic_load(&m_enabled) || atomic_load(&m_enable_changed);
-    m_snapshot.scanning = false;
-    if (cancelled)
+    if (m_scan_invalidated)
     {
-        m_auto_scan_ready = false;
-        m_snapshot.publish_sequence++;
-        atomic_fetch_and(&m_scan_flags, ~WIFI_SCAN_RUNNING);
-        wifi_unlock();
-        return;
+        m_snapshot.scan_error = -RT_EBUSY;
+        m_snapshot.error = -RT_EBUSY;
     }
-    if (!error && m_scan_invalidated)
+    if (timeout)
     {
-        error = -RT_EBUSY;
+        m_snapshot.scan_error = -RT_ETIMEOUT;
+        m_snapshot.error = -RT_ETIMEOUT;
     }
-    m_snapshot.scan_error = error;
-    if (error)
+    /* 快速空返回只视为扫描未确认，不计入连续空结果；有热点时立即接受。 */
+    bool short_empty = !m_snapshot.scan_error && !m_scan_ap_num &&
+                       m_scan_call_ms < WIFI_EMPTY_SCAN_MIN_MS;
+    if (short_empty)
     {
-        m_snapshot.error = error;
+        m_snapshot.scan_error = -RT_EBUSY;
+        m_snapshot.error = -RT_EBUSY;
     }
-    /* 与串口一致：成功的空列表也是本轮结果，不按耗时改判或二次扫描。 */
-    if (!m_snapshot.scan_error)
+    bool confirm_empty = !m_snapshot.scan_error && !m_scan_ap_num && !m_empty_scan_retry;
+    bool retry = short_empty || confirm_empty;
+    m_empty_scan_retry = confirm_empty;
+    if (retry)
+    {
+        m_scan_retry_tick = wifi_now();
+        m_scan_delayed = true;
+        atomic_store(&m_scan_requested, true);
+    }
+    if (!m_snapshot.scan_error && !retry)
     {
         m_snapshot.ap_num = m_scan_ap_num;
         memcpy(m_snapshot.ap_list, m_scan_aps, m_scan_ap_num * sizeof(m_scan_aps[0]));
     }
-    m_auto_scan_ready = !m_snapshot.scan_error && m_scan_ap_num > 0;
+    m_auto_scan_ready = !m_snapshot.scan_error && !retry && m_scan_ap_num > 0;
+    m_snapshot.scanning = false;
     m_snapshot.scan_sequence++;
     m_snapshot.publish_sequence++;
     int scan_error = m_snapshot.scan_error;
-    int collected = m_scan_ap_num;
-    int published = m_snapshot.ap_num;
-    /* saved 标志只查 RAM；与列表一起发布，避免收尾再触发一次页面更新。 */
-    for (int i = 0; i < m_snapshot.ap_num; i++)
-    {
-        m_snapshot.ap_list[i].saved = wifi_credentials_find(m_snapshot.ap_list[i].ssid) != NULL;
-    }
     /* 扫描完成后排序一次，页面直接按顺序显示。 */
     for (int i = 1; i < m_snapshot.ap_num; i++)
     {
@@ -496,10 +496,14 @@ static void wifi_scan_finish(int error)
         }
         m_snapshot.ap_list[j] = ap;
     }
-    atomic_fetch_and(&m_scan_flags, ~WIFI_SCAN_RUNNING);
     wifi_unlock();
-    rt_kprintf("[wifi] scan done: collected=%d error=%d sync_ret=%d published=%d call=%lu ms\n",
-               collected, scan_error, sync_ret, published, (unsigned long)m_scan_call_ms);
+    if (short_empty) {
+        rt_kprintf("[wifi] short empty scan: call=%lu ms, retry in %u ms\n",
+                   (unsigned long)m_scan_call_ms, WIFI_SCAN_RETRY_DELAY_MS);
+    }
+    rt_kprintf("[wifi] scan done: collected=%d error=%d elapsed=%lu ms retry=%d\n",
+               m_scan_ap_num, scan_error, (unsigned long)(wifi_now() - m_scan_tick), retry);
+    wifi_saved_update();
 }
 
 /* 连接失败统一收尾；重试计时仅在连接结束时更新，与页面扫描无关。 */
@@ -542,7 +546,7 @@ static void wifi_join_fail(wifi_state_t state, int error)
                m_join_automatic, error, state);
     /* 有原连接时先直接恢复，不让扫描阻塞 0.7 秒后的回连。 */
     if (m_auto_connect && !restore_previous) {
-        wifi_scan_queue_set(true);
+        atomic_store(&m_scan_requested, true);
     }
 }
 
@@ -641,8 +645,8 @@ static void wifi_connection_poll(void)
         unsigned disconnect_sequence = atomic_load(&m_disconnect_sequence);
         if (wifi_info_read(&info) && !strcmp(info.ssid, m_join.ssid))
         {
-            /* 先保存密码再发布成功，离开页面也不会漏存。临时连接跳过保存。 */
-            bool saved = m_join.temporary ? true : wifi_credentials_save(m_join.ssid, m_join.password);
+            /* 先保存密码再发布成功，离开页面也不会漏存。 */
+            bool saved = wifi_credentials_save(m_join.ssid, m_join.password);
             bool linked = rt_wlan_is_connected();
             wifi_lock();
             bool current = m_join_generation == atomic_load(&m_generation) && atomic_load(&m_enabled);
@@ -836,15 +840,16 @@ static void wifi_process(void)
         {
             rt_kprintf("[wifi] set mode failed: enabled=%d error=%d\n", enabled, error);
             atomic_store(&m_enabled, m_actual_enabled);
-            storage_wifi_enable_set(m_actual_enabled);
-            wifi_scan_queue_set(false);
+            (void)app_storage_wifi_enabled_save(m_actual_enabled);
+            atomic_store(&m_scan_requested, false);
             wifi_state_set(WIFI_STATE_DISCONNECTED, error);
             return;
         }
         m_actual_enabled = enabled;
-        m_scan_start_delayed = enabled;
-        m_scan_enable_tick = wifi_now();
+        m_scan_delayed = enabled;
+        m_scan_retry_tick = wifi_now();
         m_joining = false;
+        m_empty_scan_retry = false;
         m_auto_scan_ready = false;
         m_retry_tick = wifi_now() - WIFI_RETRY_MS;
         atomic_store(&m_link_lost, false);
@@ -860,7 +865,7 @@ static void wifi_process(void)
         m_snapshot.ap_num = 0;
         m_snapshot.target_ssid[0] = 0;
         wifi_unlock();
-        wifi_scan_queue_set(enabled);
+        atomic_store(&m_scan_requested, enabled);
         if (!enabled)
         {
             return;
@@ -876,7 +881,7 @@ static void wifi_process(void)
         m_auto_connect = true;
         m_auto_scan_ready = false;
         m_retry_tick = wifi_now() - WIFI_RETRY_MS;
-        wifi_scan_queue_set(true);
+        atomic_store(&m_scan_requested, true);
     }
     /* 首次启用时读取本机 WiFi MAC。 */
     if (!m_station_mac[0])
@@ -904,16 +909,32 @@ static void wifi_process(void)
         {
             wifi_state_set(WIFI_STATE_DISCONNECTED, 0);
             m_auto_connect = true;
-            wifi_scan_queue_set(true);
+            atomic_store(&m_scan_requested, true);
         }
     }
 
     /* 在开始新一轮处理前复制请求和当前代次。 */
     wifi_lock();
+    bool scanning = m_snapshot.scanning;
     wifi_request_t request = m_request;
     unsigned generation = atomic_load(&m_generation);
-    memset(&m_request, 0, sizeof(m_request));
+    if (!scanning)
+    {
+        memset(&m_request, 0, sizeof(m_request));
+    }
     wifi_unlock();
+    /* 扫描期间也处理断线；已经收到完成事件时不再误判为超时。 */
+    if (scanning)
+    {
+        wifi_connection_poll();
+        bool done = atomic_exchange(&m_scan_done, false);
+        bool timeout = !done && wifi_now() - m_scan_tick >= WIFI_SCAN_TIMEOUT_MS;
+        if (done || timeout)
+        {
+            wifi_scan_finish(timeout);
+        }
+        return;
+    }
     /* 执行当前待处理命令。 */
     switch (request.command)
     {
@@ -959,10 +980,10 @@ static void wifi_process(void)
             return;
         }
     }
-    if (atomic_load(&m_scan_flags) & WIFI_SCAN_PENDING)
+    if (atomic_load(&m_scan_requested))
     {
-        /* 仅启用后的首轮延迟，等待期间工作线程仍可处理连接和开关。 */
-        if (m_scan_start_delayed && wifi_now() - m_scan_enable_tick < WIFI_SCAN_START_DELAY_MS) {
+        /* 只延后扫描，工作线程仍处理关机、断线和连接请求；刷新按钮不能绕过等待。 */
+        if (m_scan_delayed && wifi_now() - m_scan_retry_tick < WIFI_SCAN_RETRY_DELAY_MS) {
             return;
         }
         wifi_scan_start();
@@ -972,7 +993,7 @@ static void wifi_process(void)
     if (atomic_load(&m_state) != WIFI_STATE_CONNECTED &&
         wifi_now() - m_scan_tick >= WIFI_RETRY_MS)
     {
-        wifi_scan_queue_set(true);
+        atomic_store(&m_scan_requested, true);
     }
 }
 
@@ -985,10 +1006,10 @@ static void wifi_worker(void *parameter)
     rt_wlan_config_autoreconnect(RT_FALSE);
     m_actual_enabled = rt_wlan_get_mode(WIFI_DEVICE) == RT_WLAN_STATION;
     m_auto_connect = atomic_load(&m_enabled);
-    m_scan_start_delayed = m_auto_connect;
-    m_scan_enable_tick = wifi_now();
+    m_scan_delayed = m_auto_connect;
+    m_scan_retry_tick = wifi_now();
     if (m_auto_connect) {
-        wifi_scan_queue_set(true);
+        atomic_store(&m_scan_requested, true);
     }
     m_retry_tick = wifi_now() - WIFI_RETRY_MS;
     for (;;)
@@ -1016,8 +1037,7 @@ int wifi_init(void)
     }
 
     /* 在工作线程启动前从 app_storage 的 RAM 镜像恢复 Wi-Fi 开关。 */
-    stored_enabled = storage_wifi_enable_get();
-    if (stored_enabled)
+    if (app_storage_wifi_enabled_load(&stored_enabled))
     {
         atomic_store(&m_enabled, stored_enabled);
     }
@@ -1027,13 +1047,9 @@ int wifi_init(void)
     }
 
     /* 设备事件在工作线程中绑定，注册失败会作为扫描或连接错误上报。 */
-    /* RT-Thread 下显式创建并启动 WiFi 工作线程。 */
-    rt_thread_t thread = rt_thread_create("wifi", wifi_worker, NULL,
-                                          WIFI_THREAD_STACK_SIZE, 25, 10);
-    if (thread)
+    m_thread = aicos_thread_create("wifi", WIFI_THREAD_STACK_SIZE, 25, wifi_worker, NULL);
+    if (m_thread)
     {
-        m_thread = (aicos_thread_t)thread;
-        rt_thread_startup(thread);
         return 0;
     }
 failed:
@@ -1057,7 +1073,8 @@ bool wifi_is_enabled(void)
     return atomic_load(&m_enabled);
 }
 
-static int wifi_request_enabled(bool enabled)
+/* 请求开启或关闭 WiFi。 */
+int wifi_request_set_enabled(bool enabled)
 {
     if (!m_thread || aicos_mutex_take(m_lock, 0))
     {
@@ -1066,13 +1083,19 @@ static int wifi_request_enabled(bool enabled)
     if (enabled == atomic_load(&m_enabled))
     {
         wifi_unlock();
-        return -2;
+        return 0;
+    }
+
+    if (!app_storage_wifi_enabled_save(enabled))
+    {
+        wifi_unlock();
+        return -1;
     }
 
     atomic_store(&m_enabled, enabled);
     atomic_store(&m_enable_changed, true);
     /* 即使驱动已处于站点模式，首次开启也必须明确请求扫描。 */
-    wifi_scan_queue_set(enabled);
+    atomic_store(&m_scan_requested, enabled);
     atomic_fetch_add(&m_generation, 1);
     memset(&m_manual_fallback, 0, sizeof(m_manual_fallback));
     memset(&m_request, 0, sizeof(m_request));
@@ -1081,28 +1104,13 @@ static int wifi_request_enabled(bool enabled)
     return 0;
 }
 
-/* 请求开启或关闭 WiFi。 */
-int wifi_request_set_enabled(bool enabled)
-{
-    int ret = wifi_request_enabled(enabled);
-    if (ret == 0)
-    {
-        storage_wifi_enable_set(enabled);
-    }
-    return ret;
-}
-
 /* 写入一条待处理的 WiFi 请求并唤醒工作线程。 */
-static int wifi_request(wifi_command_t command, const char *ssid, const char *password, bool temporary)
+static int wifi_request(wifi_command_t command, const char *ssid, const char *password)
 {
     /* 检查线程、WiFi 状态和请求参数。 */
-    if (!m_thread)
+    if (!m_thread || !wifi_is_enabled())
     {
         return -1;
-    }
-    if (!wifi_is_enabled())
-    {
-        wifi_request_enabled(true);
     }
     if (ssid && (!ssid[0] || strlen(ssid) > 32))
     {
@@ -1132,7 +1140,6 @@ static int wifi_request(wifi_command_t command, const char *ssid, const char *pa
         snprintf(m_request.password, sizeof(m_request.password), "%s", password);
     }
     m_request.saved = password == NULL;
-    m_request.temporary = temporary;
     if (command != WIFI_CMD_REMOVE)
     {
         atomic_fetch_add(&m_generation, 1);
@@ -1171,19 +1178,19 @@ static int wifi_request(wifi_command_t command, const char *ssid, const char *pa
 }
 
 /* 请求连接指定 WiFi 网络。 */
-int wifi_request_connect(const char *ssid, const char *password, bool temporary)
+int wifi_request_connect(const char *ssid, const char *password)
 {
     if (!ssid)
     {
         return -1;
     }
-    return wifi_request(WIFI_CMD_CONNECT, ssid, password, temporary);
+    return wifi_request(WIFI_CMD_CONNECT, ssid, password);
 }
 
 /* 请求断开当前 WiFi 连接。 */
 int wifi_disconnect(void)
 {
-    return wifi_request(WIFI_CMD_DISCONNECT, NULL, NULL, false);
+    return wifi_request(WIFI_CMD_DISCONNECT, NULL, NULL);
 }
 
 /* 请求删除指定 WiFi 网络。 */
@@ -1193,7 +1200,7 @@ int wifi_request_remove_network(const char *ssid)
     {
         return -1;
     }
-    return wifi_request(WIFI_CMD_REMOVE, ssid, NULL, false);
+    return wifi_request(WIFI_CMD_REMOVE, ssid, NULL);
 }
 
 /* 请求启动一次 WiFi 扫描。 */
@@ -1203,12 +1210,8 @@ int wifi_request_scan(void)
     {
         return -1;
     }
-    /* UI 不取快照锁；排队或执行期间的刷新合并到同一轮，不额外补扫。 */
-    unsigned expected = 0;
-    if (atomic_compare_exchange_strong(&m_scan_flags, &expected, WIFI_SCAN_PENDING))
-    {
-        aicos_sem_give(m_wakeup);
-    }
+    atomic_store(&m_scan_requested, true);
+    aicos_sem_give(m_wakeup);
     return 0;
 }
 
@@ -1221,8 +1224,7 @@ int wifi_get_scan_result(wifi_scan_result_t *result)
     }
     /* 扫描期间也返回已发布的完整列表和当前连接状态。 */
     *result = m_snapshot;
-    result->scan_pending = wifi_is_enabled() &&
-                           (atomic_load(&m_scan_flags) & WIFI_SCAN_PENDING);
+    result->scan_pending = wifi_is_enabled() && atomic_load(&m_scan_requested);
     wifi_unlock();
     return 0;
 }
