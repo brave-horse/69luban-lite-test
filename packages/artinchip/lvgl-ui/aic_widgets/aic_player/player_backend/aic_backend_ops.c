@@ -25,6 +25,7 @@
 #include "frame_allocator.h"
 #include "backend_common.h"
 
+#define INVALID_AREA          -9527
 #define FRAME_TIMEOUT         200
 #define DECODER_NOT_CREATED   4099
 #define FRAME_CAPTURE_TIMEOUT 4100
@@ -49,6 +50,7 @@ struct aic_player_ctx {
     uint16_t draw_layer;
 
     bool keep_last_frame;
+    int8_t bg_blend_ui_en; /* -1: never written, 0/1: the value written to DE */
 
     /* mjpeg */
     lv_ll_t frame_ll;
@@ -87,6 +89,7 @@ static void player_free_frame_buffer(struct aic_player_ctx *aic_ctx);
 static uint8_t *player_get_image_date(struct aic_player_ctx *aic_ctx);
 static int player_select_layer(struct aic_player_ctx *aic_ctx);
 static int player_set_ui_alpha_global(struct aic_player_ctx *aic_ctx);
+static int player_set_bg_blend_ui_config(struct aic_player_ctx *aic_ctx, bool enable);
 static int player_config_check(struct aic_player_ctx *aic_ctx);
 static int player_check_hw_capability(uint32_t rotate, uint32_t scale_x, uint32_t scale_y);
 static void player_resource_cleanup(struct aic_player_ctx *aic_ctx);
@@ -106,9 +109,8 @@ static int aic_player_event_callback(void *ctx, int event_type, int param1, int 
 static void *player_decode_entry(void *ptr);
 
 /* Player command handlers */
-static lv_res_t player_handle_update_display_area(void *ctx,void* data);
+static lv_res_t player_handle_update_display_area(void *ctx, void* data);
 static lv_res_t player_handle_get_frame(void *ctx);
-static lv_res_t player_handle_set_video_layer_visible(void *ctx, void *data);
 
 const player_backend_ops_t aic_backend_ops_template  = {
     .name = "aic_player",
@@ -145,6 +147,8 @@ static void * aic_player_backend_create(void)
         LV_LOG_ERROR("alloc aic_player_ctx failed");
         goto create_backend_failed;
     }
+
+    aic_ctx->bg_blend_ui_en = -1;
 
     if (backend_get_screen_info(&aic_ctx->screen_info) < 0) {
         lv_mem_free(ops);
@@ -193,6 +197,9 @@ static void aic_player_backend_destroy(void *ctx)
         int enable = 0;
         aic_player_control(aic_ctx->player, AIC_PLAYER_CMD_SET_VIDEO_RENDER_KEEP_LAST_FRAME, &enable);
     }
+
+    if (aic_ctx->bg_blend_ui_en > 0)
+        player_set_bg_blend_ui_config(aic_ctx, false);
 
     player_resource_cleanup(aic_ctx);
 
@@ -289,6 +296,7 @@ static lv_res_t aic_player_backend_set_src(void *ctx, const char *src)
             aic_player_control(aic_ctx->player, AIC_PLAYER_CMD_SET_VIDEO_RENDER_KEEP_LAST_FRAME, &enable);
             aic_ctx->keep_last_frame = true;
         }
+        player_set_bg_blend_ui_config(aic_ctx, true);
     }
 
     atomic_store(&aic_ctx->status, PLAYER_STATUS_READY);
@@ -369,9 +377,7 @@ static lv_res_t aic_player_backend_control(void *ctx, player_cmd_t cmd, void *da
         case PLAYER_CMD_GET_FRAME:
             return player_handle_get_frame(ctx);
         case PLAYER_CMD_UPDATE_DISPLAY_AREA:
-            return player_handle_update_display_area(ctx,data);
-        case PLAYER_CMD_SET_VIDEO_LAYER_VISIBLE:
-            return player_handle_set_video_layer_visible(ctx, data);
+            return player_handle_update_display_area(ctx, data);
         case PLAYER_CMD_GET_IMAGE_SRC:
             if (!aic_ctx->image_src || !data) {
                 return LV_RES_INV;
@@ -388,51 +394,6 @@ static lv_res_t aic_player_backend_control(void *ctx, player_cmd_t cmd, void *da
     }
 
     return res;
-}
-
-/* VIDEO layer is independent from LVGL objects, so switch it through AICFB. */
-static lv_res_t player_handle_set_video_layer_visible(void *ctx, void *data)
-{
-    const player_backend_ops_t *player_ctx = (player_backend_ops_t *)ctx;
-    struct aic_player_ctx *aic_ctx;
-    struct aicfb_layer_data layer = {0};
-    struct mpp_fb *fb;
-
-    CHECK_DATA_OR_RETURN(data, PLAYER_CMD_SET_VIDEO_LAYER_VISIBLE);
-    if (!player_ctx || !(aic_ctx = player_ctx->ctx))
-        return LV_RES_INV;
-
-    /* UI-buffer modes are regular LVGL objects and need no hardware-layer action. */
-    if (aic_ctx->draw_layer != LV_AIC_PLAYER_LAYER_VIDEO)
-        return LV_RES_OK;
-
-    fb = mpp_fb_open();
-    if (!fb) {
-        LV_LOG_ERROR("open FB failed when changing video layer visibility");
-        return LV_RES_INV;
-    }
-
-    layer.layer_id = AICFB_LAYER_TYPE_VIDEO;
-    if (mpp_fb_ioctl(fb, AICFB_GET_LAYER_CONFIG, &layer) < 0) {
-        LV_LOG_ERROR("get video layer config failed");
-        mpp_fb_close(fb);
-        return LV_RES_INV;
-    }
-
-    layer.enable = *(bool *)data ? 1U : 0U;
-    if (mpp_fb_ioctl(fb, AICFB_UPDATE_LAYER_CONFIG, &layer) < 0) {
-        LV_LOG_ERROR("update video layer visibility failed");
-        mpp_fb_close(fb);
-        return LV_RES_INV;
-    }
-
-    /* Disabling must reach the panel before the Tab content starts moving. */
-    if (!layer.enable && mpp_fb_ioctl(fb, AICFB_WAIT_FOR_VSYNC, &layer) < 0) {
-        LV_LOG_WARN("wait video layer VSYNC failed");
-    }
-
-    mpp_fb_close(fb);
-    return LV_RES_OK;
 }
 
 /* Core player functionality functions */
@@ -602,9 +563,9 @@ static int player_select_layer(struct aic_player_ctx *aic_ctx)
 
 #ifdef PRJ_CHIP
     if (aic_ctx->media_info.has_video == 1) {
-        if (strcmp(PRJ_CHIP, "d12x") == 0) {
+        if (strncmp(PRJ_CHIP, "d12x", sizeof("d12x")) == 0) {
             draw_layer = LV_AIC_PLAYER_LAYER_UI_DOUBLE_BUF;
-        } else if ((strcmp(PRJ_CHIP, "d13x") == 0) || (strcmp(PRJ_CHIP, "d21x") == 0) || (strcmp(PRJ_CHIP, "d12p") == 0)) {
+        } else if ((strncmp(PRJ_CHIP, "d13x", sizeof("d13x")) == 0) || (strncmp(PRJ_CHIP, "d21x", sizeof("d21x")) == 0) || (strncmp(PRJ_CHIP, "d12p", sizeof("d12p")) == 0)) {
 #if defined(AIC_MPP_PLAYER_VIDEO_EXT_RENDER)
         draw_layer = LV_AIC_PLAYER_LAYER_UI_DOUBLE_BUF;
 #else
@@ -643,6 +604,33 @@ static int player_set_ui_alpha_global(struct aic_player_ctx *aic_ctx)
     return 0;
 }
 
+static int player_set_bg_blend_ui_config(struct aic_player_ctx *aic_ctx, bool enable)
+{
+    struct mpp_fb *fb = NULL;
+    unsigned int value = enable ? 1 : 0;
+
+    if (aic_ctx->bg_blend_ui_en == (int8_t)value)
+        return 0;
+
+    fb = mpp_fb_open();
+    if (!fb) {
+        LV_LOG_ERROR("Failed to open FB");
+        return -1;
+    }
+
+    if (mpp_fb_ioctl(fb, AICFB_UPDATE_BG_BLEND_UI_CONFIG, &value) < 0) {
+        LV_LOG_ERROR("Failed to update bg blend ui config");
+        mpp_fb_close(fb);
+        return -1;
+    }
+    mpp_fb_close(fb);
+
+    aic_ctx->bg_blend_ui_en = (int8_t)value;
+    LV_LOG_USER("bg blend ui config: %d", (int)value);
+
+    return 0;
+}
+
 static int player_config_check(struct aic_player_ctx *aic_ctx)
 {
     if (aic_ctx->draw_layer == LV_AIC_PLAYER_LAYER_VIDEO) {
@@ -665,7 +653,7 @@ static int player_config_check(struct aic_player_ctx *aic_ctx)
     if (aic_ctx->draw_layer == LV_AIC_PLAYER_LAYER_UI_DOUBLE_BUF) {
 #ifdef PRJ_CHIP
 #ifndef AIC_MPP_PLAYER_VIDEO_EXT_RENDER
-        if (strcmp(PRJ_CHIP, "d12x") == 0) {
+        if (strncmp(PRJ_CHIP, "d12x", sizeof("d12x")) == 0) {
             LV_LOG_ERROR("D12 can't nor render video:\n"
                  "Please use command scons --menuconfig, and open the configuration according to the path:\n"
                  "-----------------ArtInChip Luban-Lite SDK Configuration------------ \n"
@@ -687,9 +675,9 @@ static int player_config_check(struct aic_player_ctx *aic_ctx)
 static int player_check_hw_capability(uint32_t rotate, uint32_t scale_x, uint32_t scale_y)
 {
 #ifdef PRJ_CHIP
-    if (strcmp(PRJ_CHIP, "d12x") == 0) {
+    if (strncmp(PRJ_CHIP, "d12x", sizeof("d12x")) == 0) {
         return true;
-    } else if (strcmp(PRJ_CHIP, "d13x") == 0) {
+    } else if (strncmp(PRJ_CHIP, "d13x", sizeof("d13x")) == 0) {
 #if LVGL_VERSION_MAJOR == 8
         bool scale_condition = (scale_x == 256);
 #elif LVGL_VERSION_MAJOR == 9
@@ -700,7 +688,7 @@ static int player_check_hw_capability(uint32_t rotate, uint32_t scale_x, uint32_
         } else {
             return true;
         }
-    } else if (strcmp(PRJ_CHIP, "d21x") == 0) {
+    } else if (strncmp(PRJ_CHIP, "d21x", sizeof("d21x")) == 0) {
         if (rotate == 0 || rotate == 900 || rotate == 1800 || rotate == 2700) {
             return false;
         } else {
@@ -1077,19 +1065,22 @@ static int calc_video_physical_display_rect(struct mpp_rect *disp_rect, lv_area_
     return 0;
 }
 
-static lv_res_t player_handle_update_display_area(void *ctx,void* data)
+static lv_res_t player_handle_update_display_area(void *ctx, void* data)
 {
     player_backend_ops_t *player_ctx = (player_backend_ops_t *)ctx;
     lv_obj_t *obj = (lv_obj_t *)player_ctx->obj;
     struct aic_player_ctx *aic_ctx = player_ctx->ctx;
-
-    int ret = -1;
     u32 video_rotate = MPP_ROTATION_0;
     lv_image_t *image = (lv_image_t *)obj;
     struct mpp_rect disp_rect = {0};
+    int ret = -1;
+    bool area_reset = false;
 
     if (!aic_ctx || aic_ctx->draw_layer != LV_AIC_PLAYER_LAYER_VIDEO)
         return LV_RES_INV;
+
+    if (data)
+        area_reset = true;
 
     lv_point_t pivot_px = {0};
     lv_image_get_pivot(obj, &pivot_px);
@@ -1117,10 +1108,8 @@ static lv_res_t player_handle_update_display_area(void *ctx,void* data)
                                        image->scale_y, &pivot_px);
 #endif
 
-    if (data){
-        aic_ctx->area.x1=-1;
-        aic_ctx->area.x2=-1;
-    }
+    if (area_reset)
+        memset(&aic_ctx->area, (unsigned char)INVALID_AREA, sizeof(lv_area_t));
 
     lv_area_move(&real_area, area.x1, area.y1);
     if (aic_ctx->image_rotation == lv_image_get_rotation(obj) &&
@@ -1151,7 +1140,7 @@ static lv_res_t player_handle_update_display_area(void *ctx,void* data)
         LV_LOG_ERROR("aic_player_set_disp_rect failed");
         return LV_RES_INV;
     }
-    
+
     if (calc_video_mpp_rotation_with_check(obj, &video_rotate) < 0)
         return LV_RES_INV;
 

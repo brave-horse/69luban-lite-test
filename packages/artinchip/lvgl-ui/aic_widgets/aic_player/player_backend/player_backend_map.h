@@ -15,6 +15,8 @@
 #define LV_DISP_ROTATION_270    LV_DISP_ROT_270
 
 #define LV_IMAGE_SRC_FILE       LV_IMG_SRC_FILE
+#define LV_IMAGE_SRC_SYMBOL     LV_IMG_SRC_SYMBOL
+#define LV_IMAGE_SRC_UNKNOWN    LV_IMG_SRC_UNKNOWN
 #define lv_disp_rotation_t      lv_disp_rot_t
 
 #define lv_malloc               lv_mem_alloc

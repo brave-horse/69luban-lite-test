@@ -86,7 +86,6 @@ typedef enum {
     LV_AIC_PLAYER_CMD_GET_PLAY_TIME,  /* data type is u64 *, unite: microsecond */
     LV_AIC_PLAYER_CMD_ATTACH_SLAVE, /* data type is slave player */
     LV_AIC_PLAYER_CMD_ATTACH_GROUP,   /* data is lv_obj_t *, group object, auto frame sync */
-    LV_AIC_PLAYER_CMD_SET_VIDEO_LAYER_VISIBLE, /* data type is bool * */
     LV_AIC_PLAYER_CMD_SET_PLAYBACK_RATE, /* data type is float *, range: 0.1 ~ 10.0 */
     LV_AIC_PLAYER_CMD_GET_PLAYBACK_RATE, /* data type is float * */
 } lv_aic_player_cmd_t;

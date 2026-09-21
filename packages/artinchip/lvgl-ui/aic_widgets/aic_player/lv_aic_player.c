@@ -31,6 +31,7 @@ static void player_set_width(lv_obj_t *obj, uint32_t width);
 static void player_set_height(lv_obj_t *obj, uint32_t height);
 static void player_reset_size(lv_obj_t *obj);
 static void player_update_size(lv_obj_t *obj);
+static void player_clear_image_src(lv_obj_t *obj);
 
 static void lv_aic_player_constructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
 static void lv_aic_player_destructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
@@ -131,9 +132,8 @@ src_failed:
 
 void lv_aic_player_set_cmd(lv_obj_t * obj, lv_aic_player_cmd_t cmd, void *data)
 {
-    uint8_t area_reset = true;
-
     lv_aic_player_t * player = (lv_aic_player_t *)obj;
+    uint8_t display_area_reset = true;
 
     if (!obj || !player->ctx || !player->timer || lv_player_is_slave(obj))
         return;
@@ -142,19 +142,15 @@ void lv_aic_player_set_cmd(lv_obj_t * obj, lv_aic_player_cmd_t cmd, void *data)
     case LV_AIC_PLAYER_CMD_START:
         player_backend_control(player->ctx, PLAYER_CMD_START, data);
         player_backend_control(player->ctx, PLAYER_CMD_GET_FRAME, NULL);
-        //lv_obj_update_layout(obj);
-        player_backend_control(player->ctx, PLAYER_CMD_UPDATE_DISPLAY_AREA, &area_reset);
+        player_backend_control(player->ctx, PLAYER_CMD_UPDATE_DISPLAY_AREA, &display_area_reset);
         lv_timer_resume(player->timer);
         break;
     case LV_AIC_PLAYER_CMD_STOP:
-        if (player->ctx) {
-            player_backend_destroy(player->ctx);
-            player->ctx = NULL;
-            LV_LOG_WARN("The playback resource has been release, indicating a possible exception.");
-        }
         if (lv_image_get_src(obj))
             lv_image_cache_drop(lv_image_get_src(obj));
-        lv_image_set_src(obj, NULL);
+        player_clear_image_src(obj);
+        player_backend_destroy(player->ctx);
+        player->ctx = NULL;
         lv_timer_pause(player->timer);
         break;
     case LV_AIC_PLAYER_CMD_PAUSE:
@@ -190,9 +186,6 @@ void lv_aic_player_set_cmd(lv_obj_t * obj, lv_aic_player_cmd_t cmd, void *data)
         break;
     case LV_AIC_PLAYER_CMD_ATTACH_GROUP:
         player->group = (lv_obj_t *)data;
-        break;
-    case LV_AIC_PLAYER_CMD_SET_VIDEO_LAYER_VISIBLE:
-        player_backend_control(player->ctx, PLAYER_CMD_SET_VIDEO_LAYER_VISIBLE, data);
         break;
     case LV_AIC_PLAYER_CMD_SET_PLAYBACK_RATE:
         if (!data) {
@@ -336,6 +329,19 @@ static bool lv_player_is_slave(lv_obj_t *obj)
     return lv_obj_check_type(obj, &lv_aic_slave_class);
 }
 
+static void player_clear_image_src(lv_obj_t *obj)
+{
+    lv_image_t *img = (lv_image_t *)obj;
+
+    lv_obj_invalidate(obj);
+
+    if (img->src_type == LV_IMAGE_SRC_FILE || img->src_type == LV_IMAGE_SRC_SYMBOL)
+        lv_free((void *)img->src);
+
+    img->src      = NULL;
+    img->src_type = LV_IMAGE_SRC_UNKNOWN;
+}
+
 static void lv_player_attach_slave(lv_obj_t * obj, lv_obj_t * slave_obj)
 {
     lv_aic_player_t * player = (lv_aic_player_t *)obj;
@@ -390,7 +396,7 @@ static void lv_player_remove_all_slaves(lv_obj_t *obj)
 
     _LV_LL_READ(&player->slave_players, node) {
         lv_obj_t *bound_slave = *(lv_obj_t **)node;
-        lv_image_set_src(bound_slave, NULL);
+        player_clear_image_src(bound_slave);
     }
 
     _lv_ll_clear(&player->slave_players);
@@ -771,6 +777,8 @@ int32_t lv_aic_player_get_scale_x(lv_obj_t * obj)
     return 0;
 #elif LVGL_VERSION_MAJOR == 9
     return lv_image_get_scale_x(obj);
+#else
+    return 0;
 #endif
 }
 
@@ -781,6 +789,8 @@ int32_t lv_aic_player_get_scale_y(lv_obj_t * obj)
     return 0;
 #elif LVGL_VERSION_MAJOR == 9
     return lv_image_get_scale_y(obj);
+#else
+    return 0;
 #endif
 }
 
