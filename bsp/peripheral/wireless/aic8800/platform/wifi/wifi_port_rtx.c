@@ -12,6 +12,8 @@
 #include "fhost.h"
 #include "cli_al.h"
 
+#define WIFI_INIT_FAILURE_TEST 1
+
 #ifdef WIFI_USING_LOOPBACK_NETDEV
 bool loop_dev_reg_flag = 0;
 #endif
@@ -21,6 +23,10 @@ rt_err_t aic8800_init(struct rt_wlan_device *wlan)
 {
     int ret = 0;
     AIC_LOG_PRINTF("%s, mode=%d\n", __func__, wlan->mode);
+#if WIFI_INIT_FAILURE_TEST
+    AIC_LOG_ERROR("[wifi-test] simulate init failure reported as success\n");
+    return RT_EOK;
+#endif
     #if 0
     AIC_LOG_PRINTF("%s ctrl pwrkey\n", __func__);
     platform_pwr_wifi_pin_init();
@@ -157,7 +163,9 @@ rt_err_t aic8800_scan(struct rt_wlan_device *wlan, struct rt_scan_info *scan_inf
             scan_info->bssid[3], scan_info->bssid[4], scan_info->bssid[5]);
         AIC_LOG_PRINTF("channel:%d->%d, passive=%d\n", scan_info->channel_min, scan_info->channel_max, scan_info->passive);
     }
+#if !WIFI_INIT_FAILURE_TEST
     wlan_if_scan(aic8800_scan_result_callback);
+#endif
     rt_wlan_dev_indicate_event_handle(s_wlan_dev, RT_WLAN_DEV_EVT_SCAN_DONE, NULL);
     return 0;
 }
